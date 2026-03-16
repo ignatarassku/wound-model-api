@@ -2,25 +2,38 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System dependencies
+# Install system dependencies + git-lfs so LFS files are pulled correctly
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    git \
+    git-lfs \
+    && git lfs install \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CPU-only PyTorch first (smaller image, faster build)
+# Install Python dependencies (numpy<2 required for torch compatibility)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy only what's needed for inference (data/ is excluded via .dockerignore)
+# Copy source code and checkpoint
 COPY src/ ./src/
-COPY checkpoints/best_model.pth ./checkpoints/best_model.pth
 COPY main.py .
+COPY checkpoints/ ./checkpoints/
 
-# Non-root user for security
-RUN useradd -m appuser && chown -R appuser /app
-USER appuser
+# Verify the checkpoint is a real binary (not a Git LFS pointer)
+RUN python -c "
+import os, sys
+path = 'checkpoints/best_model.pth'
+size = os.path.getsize(path)
+print(f'Checkpoint size: {size} bytes')
+if size < 10000:
+    with open(path, 'rb') as f:
+        header = f.read(200)
+    print('File header:', header)
+    print('ERROR: Checkpoint looks like an LFS pointer, not a real model file.')
+    sys.exit(1)
+print('Checkpoint OK - real binary file confirmed')
+"
 
 EXPOSE 8000
 
-# Use $PORT env var (Railway sets this automatically)
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
