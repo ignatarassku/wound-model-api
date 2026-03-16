@@ -31,14 +31,42 @@ CHECKPOINT_PATH = Path(__file__).parent / "checkpoints" / "best_model.pth"
 
 # ── Startup / shutdown ─────────────────────────────────────────────────────
 
+def download_checkpoint():
+    """
+    Download best_model.pth from GitHub LFS at startup if not present.
+    MODEL_DOWNLOAD_URL env var must point to the raw LFS download URL.
+    """
+    if CHECKPOINT_PATH.exists() and CHECKPOINT_PATH.stat().st_size > 10000:
+        print(f"[WoundWatch] Checkpoint already exists ({CHECKPOINT_PATH.stat().st_size} bytes)")
+        return
+
+    url = os.environ.get("MODEL_DOWNLOAD_URL")
+    if not url:
+        raise RuntimeError(
+            "Checkpoint not found and MODEL_DOWNLOAD_URL env var is not set. "
+            "Set it to the direct download URL of best_model.pth."
+        )
+
+    print(f"[WoundWatch] Downloading checkpoint from {url}...")
+    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    import urllib.request
+    urllib.request.urlretrieve(url, CHECKPOINT_PATH)
+
+    size = CHECKPOINT_PATH.stat().st_size
+    if size < 10000:
+        CHECKPOINT_PATH.unlink()
+        raise RuntimeError(f"Downloaded file is too small ({size} bytes) — likely not a valid checkpoint.")
+
+    print(f"[WoundWatch] Checkpoint downloaded successfully ({size} bytes)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load the U-Net checkpoint once at startup, release at shutdown."""
+    """Download checkpoint if needed, load model once at startup, release at shutdown."""
     global model
 
-    if not CHECKPOINT_PATH.exists():
-        raise RuntimeError(f"Checkpoint not found at {CHECKPOINT_PATH}. "
-                           "Make sure best_model.pth is in the checkpoints/ directory.")
+    download_checkpoint()
 
     print(f"[WoundWatch] Loading model from {CHECKPOINT_PATH}...")
     model = UNet()
