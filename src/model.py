@@ -1,20 +1,24 @@
 """
-model.py — U-Net architecture for binary wound segmentation.
+model.py — U-Net architectures for wound segmentation.
 
 Architecture:
     Encoder: ResNet34 pretrained on ImageNet (transfer learning)
     Decoder: U-Net upsampling path with skip connections
-    Output:  Single-channel logits → apply sigmoid for probabilities
 
-The model outputs RAW LOGITS (no sigmoid applied).
-Apply torch.sigmoid() during inference, or use BCEWithLogitsLoss during training.
+Two model variants:
+    UNet           — binary segmentation (wound vs background)
+                     Output: [B, 1, H, W] raw logits → sigmoid for probability.
+    TissueUNet     — multi-class tissue segmentation (4 classes)
+                     Shares the frozen ResNet34 encoder with UNet.
+                     Output: [B, N_CLASSES, H, W] raw logits → softmax for class probs.
 
 Usage:
-    from src.model import UNet
-    model = UNet()
-    logits = model(images)          # [B, 1, H, W] — raw logits
-    probs  = torch.sigmoid(logits)  # [B, 1, H, W] — probabilities [0, 1]
+    from src.model import UNet, TissueUNet, get_model, get_tissue_model
+    seg_model    = get_model()
+    tissue_model = get_tissue_model(seg_checkpoint="results/checkpoints/best_model.pth")
 """
+
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -138,6 +142,127 @@ class UNet(nn.Module):
         out = self.final_conv(out)      # [B, 1,  H, W] — logits
 
         return out
+
+
+# ── Tissue U-Net (multi-class head on shared encoder) ─────────────────────
+
+class TissueUNet(nn.Module):
+    """
+    Tissue type segmentation model built on top of the binary UNet.
+
+    Strategy:
+        1. Load the pretrained binary UNet encoder (enc0-enc4).
+        2. Freeze the encoder — tissue features are learned only in the decoder.
+        3. Add a fresh lightweight decoder head that outputs N_CLASSES logits.
+
+    Input:  [B, 3, 256, 256]
+    Output: [B, TISSUE_CLASSES, 256, 256] — raw logits; apply softmax for probs.
+
+    The binary segmentation mask is used as input gating to focus predictions
+    inside the wound region during inference (optional).
+    """
+
+    def __init__(
+        self,
+        num_classes:       int  = CFG.TISSUE_CLASSES,
+        freeze_encoder:    bool = True,
+    ) -> None:
+        super().__init__()
+
+        backbone = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
+
+        self.enc0 = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)
+        self.pool = backbone.maxpool
+        self.enc1 = backbone.layer1
+        self.enc2 = backbone.layer2
+        self.enc3 = backbone.layer3
+        self.enc4 = backbone.layer4
+
+        if freeze_encoder:
+            for p in self.enc0.parameters(): p.requires_grad = False
+            for p in self.enc1.parameters(): p.requires_grad = False
+            for p in self.enc2.parameters(): p.requires_grad = False
+            for p in self.enc3.parameters(): p.requires_grad = False
+            for p in self.enc4.parameters(): p.requires_grad = False
+
+        # Fresh tissue decoder — same shape as the binary decoder
+        self.dec4 = DecoderBlock(512, 256, 256)
+        self.dec3 = DecoderBlock(256, 128, 128)
+        self.dec2 = DecoderBlock(128,  64,  64)
+        self.dec1 = DecoderBlock( 64,  64,  32)
+
+        self.final_upsample = nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2)
+        self.dropout        = nn.Dropout2d(p=0.2)
+        self.final_conv     = nn.Conv2d(16, num_classes, kernel_size=1)
+
+    def load_encoder_weights(self, checkpoint_path: str) -> None:
+        """
+        Bootstrap encoder from a trained binary UNet checkpoint.
+        Only encoder keys are copied; mismatched decoder keys are ignored.
+        """
+        state = torch.load(checkpoint_path, map_location="cpu")
+        encoder_keys = {k: v for k, v in state.items()
+                        if k.startswith(("enc", "pool"))}
+        missing, unexpected = self.load_state_dict(encoder_keys, strict=False)
+        print(f"[TissueUNet] Loaded {len(encoder_keys)} encoder weights "
+              f"| Missing: {len(missing)} | Unexpected: {len(unexpected)}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor [B, 3, H, W]
+        Returns:
+            Logits tensor [B, TISSUE_CLASSES, H, W]
+        """
+        s0 = self.enc0(x)
+        e  = self.pool(s0)
+        s1 = self.enc1(e)
+        s2 = self.enc2(s1)
+        s3 = self.enc3(s2)
+        s4 = self.enc4(s3)
+
+        d4  = self.dec4(s4, s3)
+        d3  = self.dec3(d4, s2)
+        d2  = self.dec2(d3, s1)
+        d1  = self.dec1(d2, s0)
+
+        out = self.final_upsample(d1)
+        out = self.dropout(out)
+        out = self.final_conv(out)
+        return out
+
+
+def get_tissue_model(
+    seg_checkpoint: Optional[str] = None,
+    freeze_encoder: bool          = True,
+) -> "TissueUNet":
+    """
+    Instantiate TissueUNet, optionally bootstrapping encoder from a binary
+    UNet checkpoint, and move to the configured device.
+
+    Args:
+        seg_checkpoint : Path to binary UNet .pth file (optional).
+        freeze_encoder : Freeze ResNet34 encoder layers (recommended).
+
+    Returns:
+        TissueUNet on CFG.DEVICE.
+    """
+    model = TissueUNet(
+        num_classes    = CFG.TISSUE_CLASSES,
+        freeze_encoder = freeze_encoder,
+    ).to(CFG.DEVICE)
+
+    if seg_checkpoint:
+        model.load_encoder_weights(seg_checkpoint)
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(
+        f"[TissueUNet] {CFG.TISSUE_CLASSES} classes | "
+        f"Trainable params: {trainable:,} / {total:,} | "
+        f"Device: {CFG.DEVICE}"
+    )
+    return model
 
 
 def get_model() -> UNet:

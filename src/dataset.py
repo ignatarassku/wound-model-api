@@ -1,15 +1,17 @@
 """
-dataset.py — PyTorch Dataset for wound image segmentation.
+dataset.py — PyTorch Datasets for wound segmentation.
 
 Handles:
 - Loading image / mask pairs from disk
 - Train augmentations (albumentations)
 - Validation / test transforms (resize + normalize only)
 - Automatic train/val/test splitting
+- TissueDataset: multi-class tissue type segmentation
 
 Usage:
-    from src.dataset import get_dataloaders
+    from src.dataset import get_dataloaders, get_tissue_dataloaders
     train_loader, val_loader, test_loader = get_dataloaders()
+    train_loader, val_loader, test_loader = get_tissue_dataloaders()
 """
 
 import os
@@ -182,6 +184,157 @@ def get_dataloaders(
     print(f"[DataLoader] Split → Train: {len(train_idx)} | Val: {len(val_idx)} | Test: {len(test_idx)}")
 
     # Assign transforms per subset via wrapper
+    train_set = _TransformSubset(full_dataset, train_idx, get_train_transforms())
+    val_set   = _TransformSubset(full_dataset, val_idx,   get_val_transforms())
+    test_set  = _TransformSubset(full_dataset, test_idx,  get_val_transforms())
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,  num_workers=0, pin_memory=False)
+    val_loader   = DataLoader(val_set,   batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
+    test_loader  = DataLoader(test_set,  batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
+
+    return train_loader, val_loader, test_loader
+
+
+# ── Tissue Dataset ────────────────────────────────────────────────────────
+
+class TissueDataset(Dataset):
+    """
+    PyTorch Dataset for multi-class tissue type segmentation.
+
+    Colour → class mapping (defined in CFG.TISSUE_COLOURS):
+        0  granulation      (255,   0,   0)
+        1  slough           (255, 255,   0)
+        2  eschar           ( 50,  50,  50)
+        3  epithelialisation(255, 192, 203)
+
+    Pixels that match none of the known colours are assigned class IGNORE_INDEX
+    (255 by default) so they are excluded from the loss.
+
+    Expects:
+        images_dir/       → RGB wound photos  (.jpg or .png)
+        tissue_masks_dir/ → RGB colour-coded tissue masks (.png)
+            Filenames must match the corresponding image stems.
+
+    Args:
+        images_dir       : Path to wound images.
+        tissue_masks_dir : Path to colour-coded tissue mask images.
+        transform        : Albumentations transform pipeline to apply.
+        ignore_index     : Class index assigned to unknown pixels (excluded from loss).
+    """
+
+    IGNORE_INDEX: int = 255
+
+    def __init__(
+        self,
+        images_dir:       Path,
+        tissue_masks_dir: Path,
+        transform:        Optional[A.Compose] = None,
+        ignore_index:     int = 255,
+    ) -> None:
+        self.images_dir       = Path(images_dir)
+        self.tissue_masks_dir = Path(tissue_masks_dir)
+        self.transform        = transform
+        self.ignore_index     = ignore_index
+
+        self.image_files = sorted([
+            f for f in os.listdir(self.images_dir)
+            if f.lower().endswith((".jpg", ".jpeg", ".png"))
+        ])
+
+        if not self.image_files:
+            raise FileNotFoundError(
+                f"No images found in {self.images_dir}."
+            )
+
+        # Build colour→class lookup table (256^3 is too large; use a dict)
+        self._colour_to_class: dict = {}
+        for class_idx, rgb in CFG.TISSUE_COLOURS.items():
+            self._colour_to_class[rgb] = class_idx
+
+        print(
+            f"[TissueDataset] Found {len(self.image_files)} images | "
+            f"{CFG.TISSUE_CLASSES} tissue classes"
+        )
+
+    def __len__(self) -> int:
+        return len(self.image_files)
+
+    def _decode_tissue_mask(self, mask_rgb: np.ndarray) -> np.ndarray:
+        """Convert an RGB colour mask to a uint8 class-index array."""
+        h, w = mask_rgb.shape[:2]
+        label = np.full((h, w), self.ignore_index, dtype=np.uint8)
+        for rgb, cls in self._colour_to_class.items():
+            match = (
+                (mask_rgb[:, :, 0] == rgb[0]) &
+                (mask_rgb[:, :, 1] == rgb[1]) &
+                (mask_rgb[:, :, 2] == rgb[2])
+            )
+            label[match] = cls
+        return label
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            image : Float tensor [3, H, W] — normalized RGB image.
+            label : Long tensor  [H, W]    — class indices (0–3, or IGNORE_INDEX).
+        """
+        img_filename  = self.image_files[idx]
+        stem          = Path(img_filename).stem
+        mask_filename = stem + ".png"
+
+        image = np.array(
+            Image.open(self.images_dir / img_filename).convert("RGB")
+        )
+
+        mask_path = self.tissue_masks_dir / mask_filename
+        if not mask_path.exists():
+            raise FileNotFoundError(
+                f"Tissue mask not found: {mask_path}\n"
+                f"Expected mask for image: {img_filename}"
+            )
+        mask_rgb = np.array(Image.open(mask_path).convert("RGB"))
+        label    = self._decode_tissue_mask(mask_rgb)   # [H, W] uint8
+
+        if self.transform is not None:
+            augmented = self.transform(image=image, mask=label)
+            image = augmented["image"]                  # [3, H, W] float
+            label = augmented["mask"].long()            # [H, W]    long
+        else:
+            label = torch.from_numpy(label.astype(np.int64))
+
+        return image, label
+
+
+def get_tissue_dataloaders(
+    images_dir:       Path = CFG.IMAGES_DIR,
+    tissue_masks_dir: Path = CFG.TISSUE_MASKS_DIR,
+    batch_size:       int  = CFG.BATCH_SIZE,
+    seed:             int  = CFG.RANDOM_SEED,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """
+    Creates train / val / test DataLoaders for tissue type segmentation.
+
+    Returns:
+        Tuple of (train_loader, val_loader, test_loader)
+    """
+    full_dataset = TissueDataset(images_dir, tissue_masks_dir, transform=None)
+    n            = len(full_dataset)
+
+    indices = list(range(n))
+    random.seed(seed)
+    random.shuffle(indices)
+
+    n_train = int(CFG.TRAIN_SPLIT * n)
+    n_val   = int(CFG.VAL_SPLIT   * n)
+    train_idx = indices[:n_train]
+    val_idx   = indices[n_train : n_train + n_val]
+    test_idx  = indices[n_train + n_val :]
+
+    print(
+        f"[TissueDataLoader] Split → Train: {len(train_idx)} | "
+        f"Val: {len(val_idx)} | Test: {len(test_idx)}"
+    )
+
     train_set = _TransformSubset(full_dataset, train_idx, get_train_transforms())
     val_set   = _TransformSubset(full_dataset, val_idx,   get_val_transforms())
     test_set  = _TransformSubset(full_dataset, test_idx,  get_val_transforms())

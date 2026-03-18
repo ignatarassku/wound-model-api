@@ -63,9 +63,50 @@ class CFG:
     TARGET_ROC_AUC  = 0.90
 
     # ── Checkpoint filenames ───────────────────────────────────────────────
-    BEST_MODEL_PATH = CHECKPOINTS_DIR / "best_model.pth"
-    LAST_MODEL_PATH = CHECKPOINTS_DIR / "last_model.pth"
-    METRICS_CSV     = METRICS_DIR / "history.csv"
+    BEST_MODEL_PATH    = CHECKPOINTS_DIR / "best_model.pth"
+    LAST_MODEL_PATH    = CHECKPOINTS_DIR / "last_model.pth"
+    METRICS_CSV        = METRICS_DIR / "history.csv"
+
+    # ── Tissue type classification (Feature 1) ────────────────────────────
+    # Colour convention for tissue mask PNGs (RGB tuples):
+    #   Granulation     (255,   0,   0)  → class 0  healthy red tissue
+    #   Slough          (255, 255,   0)  → class 1  yellow necrotic tissue
+    #   Eschar          ( 50,  50,  50)  → class 2  dark/black necrotic tissue
+    #   Epithelialisation (255, 192, 203) → class 3  light pink healing skin
+    TISSUE_CLASSES     = 4
+    TISSUE_NAMES       = ["granulation", "slough", "eschar", "epithelialisation"]
+    TISSUE_COLOURS     = {
+        0: (255,   0,   0),   # granulation     — red
+        1: (255, 255,   0),   # slough          — yellow
+        2: ( 50,  50,  50),   # eschar          — near-black
+        3: (255, 192, 203),   # epithelialisation — pink
+    }
+    TISSUE_MASKS_DIR   = DATA_DIR / "tissue_masks"
+    TISSUE_MODEL_PATH  = CHECKPOINTS_DIR / "tissue_model.pth"
+    TISSUE_METRICS_CSV = METRICS_DIR / "tissue_history.csv"
+
+    # Focal loss gamma for tissue training (handles class imbalance)
+    TISSUE_FOCAL_GAMMA = 2.0
+    TISSUE_EPOCHS      = 30
+    TISSUE_LR          = 5e-5   # lower LR — encoder is frozen
+
+    # ── Healing Trajectory Prediction (Feature 3) ─────────────────────────
+    HEALING_THRESHOLD   = 0.05   # weekly area decrease > 5% of mean → "healing"
+    WORSENING_THRESHOLD = 0.05   # weekly area increase > 5% of mean → "worsening"
+
+    # ── Wound Type Classification (Feature 4) ─────────────────────────────
+    WOUND_TYPES       = [
+        "diabetic_foot_ulcer",
+        "venous_leg_ulcer",
+        "pressure_injury",
+        "surgical",
+        "burn",
+    ]
+    WOUND_TYPES_DIR    = DATA_DIR / "wound_types"     # one sub-dir per class
+    CLASSIFIER_PATH    = CHECKPOINTS_DIR / "classifier_model.pth"
+    CLASSIFIER_METRICS = METRICS_DIR / "classifier_history.csv"
+    CLASSIFIER_EPOCHS  = 20
+    CLASSIFIER_LR      = 1e-4
 
 
 def ensure_dirs() -> None:
@@ -78,5 +119,8 @@ def ensure_dirs() -> None:
         CFG.IMAGES_DIR,
         CFG.MASKS_DIR,
         CFG.RAW_DIR,
+        CFG.TISSUE_MASKS_DIR,
+        CFG.WOUND_TYPES_DIR,
+        *[CFG.WOUND_TYPES_DIR / wt for wt in CFG.WOUND_TYPES],
     ]:
         d.mkdir(parents=True, exist_ok=True)
