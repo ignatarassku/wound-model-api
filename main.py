@@ -12,13 +12,18 @@ Auth: X-API-Secret header == MODEL_API_SECRET env var
 
 import os
 import sys
+import asyncio
 import base64
 import io
 import logging
+import shutil
+import threading
+import urllib.request
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import cv2
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,7 +36,7 @@ from src.model import UNet, TissueUNet
 from src.config import CFG
 from src.measure import compute_measurements, compute_tissue_breakdown
 from src.nail_detector import detect_nail
-from src.photo_validator import validate_photo
+from src.photo_validator import PhotoQuality, validate_photo_basic, validate_wound_from_probs
 from src.push_score import (
     compute_push_area_score_v2,
     compute_push_total,
@@ -44,55 +49,121 @@ from src.classifier import WoundClassifier, get_classifier, classify_wound
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+if os.environ.get("SENTRY_DSN"):
+    import sentry_sdk
+
+    sentry_sdk.init(
+        dsn=os.environ["SENTRY_DSN"],
+        traces_sample_rate=0.1,
+        send_default_pii=False,
+    )
+
 # ── Globals ────────────────────────────────────────────────────────────────────
 
 model:             UNet             | None = None
 tissue_model:      TissueUNet       | None = None
 classifier_model:  WoundClassifier  | None = None
+model_load_error:  str | None = None
 CHECKPOINT_PATH           = Path(__file__).parent / "checkpoints" / "best_model.pth"
 TISSUE_CHECKPOINT_PATH    = Path(__file__).parent / "checkpoints" / "tissue_model.pth"
 CLASSIFIER_CHECKPOINT_PATH = Path(__file__).parent / "checkpoints" / "classifier_model.pth"
 
 # ── Startup / shutdown ─────────────────────────────────────────────────────────
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Load all model checkpoints once at startup, release at shutdown."""
+
+def _is_git_lfs_pointer(path: Path) -> bool:
+    """True if `path` is a Git LFS pointer file (common when CI/deploy never fetched LFS blobs)."""
+    try:
+        head = path.read_bytes()[:200]
+    except OSError:
+        return False
+    return head.startswith(b"version https://git-lfs.github.com/spec/v1\n")
+
+
+def _reject_lfs_pointer(path: Path, label: str) -> None:
+    if _is_git_lfs_pointer(path):
+        raise RuntimeError(
+            f"{label} at {path} is a Git LFS pointer, not real weights. "
+            "Many hosts (including Railway) do not resolve LFS in the Docker build context. "
+            "Set BINARY_CHECKPOINT_URL to a direct HTTPS URL of best_model.pth, "
+            "or bake the real file into the image with a Dockerfile download step."
+        )
+
+
+def _maybe_download_binary_checkpoint() -> None:
+    """If BINARY_CHECKPOINT_URL is set, download over a missing or LFS-pointer stub."""
+    url = os.environ.get("BINARY_CHECKPOINT_URL", "").strip()
+    if not url:
+        return
+    need = not CHECKPOINT_PATH.exists() or _is_git_lfs_pointer(CHECKPOINT_PATH)
+    if not need:
+        return
+    logger.info("[WoundWatch] Downloading binary checkpoint from BINARY_CHECKPOINT_URL …")
+    tmp = CHECKPOINT_PATH.with_suffix(".pth.part")
+    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "WoundWatch-model-api/1.0"})
+        with urllib.request.urlopen(req, timeout=900) as resp, open(tmp, "wb") as out:
+            shutil.copyfileobj(resp, out)
+        if tmp.stat().st_size < 4096:
+            raise RuntimeError("Downloaded checkpoint is too small to be valid.")
+        if _is_git_lfs_pointer(tmp):
+            raise RuntimeError("Downloaded file looks like a Git LFS pointer, not weights.")
+        tmp.replace(CHECKPOINT_PATH)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
+
+
+def _load_models_sync() -> None:
+    """Load checkpoints (runs in a background thread so /health can respond during load)."""
     global model, tissue_model, classifier_model
 
-    # ── Binary segmentation model (required) ──────────────────────────────
+    _maybe_download_binary_checkpoint()
+
     if not CHECKPOINT_PATH.exists():
         raise RuntimeError(
             f"Checkpoint not found at {CHECKPOINT_PATH}. "
-            "Make sure best_model.pth is in the checkpoints/ directory."
+            "Add best_model.pth under checkpoints/, or set BINARY_CHECKPOINT_URL to a direct download URL."
         )
 
+    _reject_lfs_pointer(CHECKPOINT_PATH, "Binary segmentation checkpoint")
+
     logger.info("[WoundWatch] Loading binary segmentation model …")
-    model      = UNet()
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=torch.device("cpu"),
-                            weights_only=False)
+    model = UNet()
+    try:
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=CFG.DEVICE, weights_only=False)
+    except Exception as e:
+        if "invalid load key" in str(e).lower():
+            raise RuntimeError(
+                f"Failed to load {CHECKPOINT_PATH}: file is not a valid PyTorch checkpoint "
+                "(often a Git LFS pointer or corrupt download). "
+                "Set BINARY_CHECKPOINT_URL or ship the real .pth in the image."
+            ) from e
+        raise
     model.load_state_dict(checkpoint["model_state"])
+    model = model.to(CFG.DEVICE)
     model.eval()
     best_iou = checkpoint.get("best_iou", "unknown")
     logger.info("[WoundWatch] Binary model ready. Best IoU: %s", best_iou)
 
-    # ── Tissue classification model (optional — only if checkpoint exists) ─
     if TISSUE_CHECKPOINT_PATH.exists():
+        _reject_lfs_pointer(TISSUE_CHECKPOINT_PATH, "Tissue checkpoint")
         logger.info("[WoundWatch] Loading tissue classification model …")
         tissue_model = TissueUNet(num_classes=CFG.TISSUE_CLASSES)
-        tissue_model.load_state_dict(
-            torch.load(TISSUE_CHECKPOINT_PATH, map_location=torch.device("cpu"))
-        )
+        tissue_model.load_state_dict(torch.load(TISSUE_CHECKPOINT_PATH, map_location=CFG.DEVICE))
+        tissue_model = tissue_model.to(CFG.DEVICE)
         tissue_model.eval()
         logger.info("[WoundWatch] Tissue model ready.")
     else:
         logger.info(
-            "[WoundWatch] No tissue checkpoint found at %s — "
-            "tissue classification disabled.", TISSUE_CHECKPOINT_PATH
+            "[WoundWatch] No tissue checkpoint found at %s — tissue classification disabled.",
+            TISSUE_CHECKPOINT_PATH,
         )
 
-    # ── Wound type classifier (optional — only if checkpoint exists) ───────
     if CLASSIFIER_CHECKPOINT_PATH.exists():
+        _reject_lfs_pointer(CLASSIFIER_CHECKPOINT_PATH, "Classifier checkpoint")
         logger.info("[WoundWatch] Loading wound type classifier …")
         classifier_model = get_classifier(
             num_classes=len(CFG.WOUND_TYPES),
@@ -101,12 +172,35 @@ async def lifespan(app: FastAPI):
         logger.info("[WoundWatch] Classifier ready (%d classes).", len(CFG.WOUND_TYPES))
     else:
         logger.info(
-            "[WoundWatch] No classifier checkpoint at %s — "
-            "wound type classification disabled.", CLASSIFIER_CHECKPOINT_PATH
+            "[WoundWatch] No classifier checkpoint at %s — wound type classification disabled.",
+            CLASSIFIER_CHECKPOINT_PATH,
         )
 
-    yield
 
+def _load_models_worker() -> None:
+    global model_load_error
+    try:
+        _load_models_sync()
+    except Exception as e:
+        logger.exception("[WoundWatch] Model loading failed")
+        # Surface the real error in /health and 503 responses (e.g. Git LFS pointer hint).
+        msg = (str(e) or repr(e)).strip()
+        if len(msg) > 1200:
+            msg = msg[:1197] + "..."
+        model_load_error = msg
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Start model loading in a background thread so Uvicorn binds immediately.
+    Railway's HTTP healthcheck can hit /health while weights are still loading.
+    """
+    global model, tissue_model, classifier_model, model_load_error
+    model_load_error = None
+    t = threading.Thread(target=_load_models_worker, name="woundwatch-model-loader", daemon=True)
+    t.start()
+    yield
     model = tissue_model = classifier_model = None
     logger.info("[WoundWatch] Models unloaded.")
 
@@ -119,9 +213,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_allowed_origins = os.environ.get(
+    "ALLOWED_ORIGINS", "https://woundwatch.vercel.app,http://localhost:3000"
+).split(",")
+_allowed_origins = [o.strip() for o in _allowed_origins if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
@@ -142,12 +241,12 @@ class AnalysisResult(BaseModel):
     photo_blur_score:     Optional[float]
     photo_brightness:     Optional[float]
 
-    # Segmentation quality (confidence-based proxies, no ground truth)
-    iou:                float
-    dice:               float
-    recall:             float
-    precision:          float
-    roc_auc:            float
+    # Confidence-based segmentation quality estimates (not ground-truth metrics)
+    confidence_iou:                float
+    confidence_dice:               float
+    confidence_recall:             float
+    confidence_precision:          float
+    confidence_roc_auc:            float
 
     # Pixel-space measurements (always present)
     wound_area_px:      int
@@ -188,8 +287,9 @@ class AnalysisResult(BaseModel):
     # PUSH score — area sub-score is auto-computed; full score via /push-score
     push_score_area:    Optional[int]   # Sub-score A (0–10), None if area unknown
 
-    # Base64-encoded PNG masks for overlay rendering
+    # Base64-encoded PNG masks for overlay rendering (Next.js uploads to Storage)
     mask_base64:        str
+    prob_heatmap_base64: Optional[str] = None
     tissue_mask_base64: Optional[str]   # colour-coded RGB PNG (None if no tissue model)
 
 # ── Preprocessing helpers ──────────────────────────────────────────────────────
@@ -206,11 +306,50 @@ def preprocess(pil_image: Image.Image) -> torch.Tensor:
     return tensor.unsqueeze(0)
 
 
+def upsample_mask_to_image_size(binary_mask: np.ndarray, pil_image: Image.Image) -> np.ndarray:
+    """
+    Map 256×256 binary mask back to original PIL dimensions (nearest neighbour).
+    Matches inverse of preprocess resize so measurements + stored PNG align with the photo.
+    """
+    w, h = pil_image.size
+    m = (binary_mask * 255).astype(np.uint8)
+    up = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+    return (up > 127).astype(np.uint8)
+
+
+def resize_probs_to_image_size(probs: np.ndarray, pil_image: Image.Image) -> np.ndarray:
+    """Bilinear resize of probability map [H, W] to original image size."""
+    w, h = pil_image.size
+    p = probs.astype(np.float32)
+    return cv2.resize(p, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def upsample_class_map_to_image_size(class_map: np.ndarray, pil_image: Image.Image) -> np.ndarray:
+    """Nearest-neighbour resize of integer class indices to original image size."""
+    w, h = pil_image.size
+    cm = class_map.astype(np.uint8)
+    up = cv2.resize(cm, (w, h), interpolation=cv2.INTER_NEAREST)
+    return up.astype(np.int64)
+
+
 def mask_to_base64(mask: np.ndarray) -> str:
     """Convert a binary mask [H, W] uint8 to a base64-encoded PNG string."""
     img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def prob_heatmap_to_base64(probs: np.ndarray) -> str:
+    """Encode probability map [H, W] float 0–1 as RGB PNG (approximate 'hot' colormap)."""
+    p = np.clip(probs.astype(np.float64), 0.0, 1.0)
+    h, w = p.shape
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    rgb[..., 0] = (np.minimum(p * 3.0, 1.0) * 255.0).astype(np.uint8)
+    rgb[..., 1] = (np.clip(p * 3.0 - 1.0, 0.0, 1.0) * 255.0).astype(np.uint8)
+    rgb[..., 2] = (np.clip(p * 3.0 - 2.0, 0.0, 1.0) * 255.0).astype(np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
@@ -230,32 +369,36 @@ def tissue_colour_mask_to_base64(class_map: np.ndarray) -> str:
 
 
 def run_tissue_inference(
-    pil_image:   Image.Image,
-    binary_mask: np.ndarray,
+    pil_image:  Image.Image,
+    full_mask:  np.ndarray,
 ) -> tuple:
     """
     Run TissueUNet inference if the model is loaded.
 
+    Args:
+        full_mask: Binary wound mask at **original image resolution** (same as segmentation overlay).
+
     Returns:
-        (breakdown_dict, tissue_class_map, tissue_mask_b64)
+        (breakdown_dict, tissue_class_map_full, tissue_mask_b64)
         All three are None if tissue_model is not loaded.
     """
     if tissue_model is None:
         return None, None, None
 
     try:
-        tensor = preprocess(pil_image)
+        tensor = preprocess(pil_image).to(CFG.DEVICE)
         with torch.no_grad():
             logits     = tissue_model(tensor)                    # [1, C, H, W]
             class_map  = logits.argmax(dim=1).squeeze().numpy()  # [H, W] int
 
-        breakdown  = compute_tissue_breakdown(
-            class_map,
-            wound_mask   = binary_mask,
+        class_map_full = upsample_class_map_to_image_size(class_map, pil_image)
+        breakdown = compute_tissue_breakdown(
+            class_map_full,
+            wound_mask   = full_mask,
             class_names  = CFG.TISSUE_NAMES,
         )
-        colour_b64 = tissue_colour_mask_to_base64(class_map)
-        return breakdown, class_map, colour_b64
+        colour_b64 = tissue_colour_mask_to_base64(class_map_full)
+        return breakdown, class_map_full, colour_b64
 
     except Exception as exc:
         logger.warning("[WoundWatch] Tissue inference failed: %s", exc)
@@ -265,100 +408,74 @@ def run_tissue_inference(
 
 @app.get("/health")
 def health():
-    """Liveness check — used by Railway and the frontend."""
-    return {
+    """Liveness check — used by Railway and the frontend (returns 200 while models load)."""
+    body: dict = {
         "status": "ok",
         "model_loaded": model is not None,
         "checkpoint": str(CHECKPOINT_PATH),
+        "version": "2.0.0",
     }
+    if model_load_error:
+        body["error"] = model_load_error
+    return body
 
 
-@app.post("/analyze", response_model=AnalysisResult)
-async def analyze(request: Request, image: UploadFile = File(...)):
+class _WoundQualityReject(Exception):
+    """Raised inside worker thread when photo / wound checks fail."""
+
+    def __init__(self, issues: list[str], guidance: str):
+        self.issues = issues
+        self.guidance = guidance
+
+
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
+
+
+def _analyze_sync(pil_image: Image.Image, basic_quality: PhotoQuality) -> AnalysisResult:
     """
-    Run U-Net wound segmentation and geometric measurement on an uploaded image.
-
-    - Accepts : multipart/form-data with an "image" field (JPEG or PNG)
-    - Auth    : X-API-Secret header must match MODEL_API_SECRET env var
-    - Returns : segmentation metrics, wound measurements (px + cm), base64 mask
-
-    Scale calibration is fully automatic:
-      1. Detect patient's fingernail → derive px/mm → convert to cm.
-      2. If nail not visible, fall back to a conservative 3.2 px/mm estimate
-         and set scale_source = "fallback_assumed" so the UI can warn the doctor.
+    Single U-Net forward pass for wound presence + full metrics (no duplicate inference).
+    Basic blur/resolution/brightness already validated in the request handler.
     """
-    # ── Auth ──────────────────────────────────────────────────────────────────
-    api_secret = os.environ.get("MODEL_API_SECRET")
-    if not api_secret or request.headers.get("X-API-Secret") != api_secret:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Secret header")
-
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
-    # ── Read image ────────────────────────────────────────────────────────────
-    image_bytes = await image.read()
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    try:
-        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not open image: {exc}")
-
-    # ── Photo quality validation ──────────────────────────────────────────────
-    quality = validate_photo(pil_image, model=model)
-    if not quality.passed:
-        logger.info("[WoundWatch] Photo rejected: %s", quality.issues)
-        raise HTTPException(
-            status_code=422,
-            detail=PhotoQualityError(
-                issues=quality.issues,
-                guidance=quality.guidance,
-            ).model_dump(),
-        )
-
-    # ── Scale calibration (fingernail detection on original resolution) ────────
     nail_result = detect_nail(pil_image)
 
-    # ── Segmentation inference ────────────────────────────────────────────────
-    try:
-        tensor = preprocess(pil_image)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not preprocess image: {exc}")
-
+    tensor = preprocess(pil_image).to(CFG.DEVICE)
     with torch.no_grad():
         logits = model(tensor)
-        probs  = torch.sigmoid(logits).squeeze().numpy()   # [H, W]
+        probs = torch.sigmoid(logits).squeeze().numpy()
 
-    binary_mask    = (probs >= CFG.THRESHOLD).astype(np.uint8)
-    wound_pixels   = int(binary_mask.sum())
-    total_pixels   = int(binary_mask.size)
-    wound_area_pct = float(wound_pixels / total_pixels)
+    wq = validate_wound_from_probs(probs, CFG.THRESHOLD)
+    if not wq.passed:
+        raise _WoundQualityReject(wq.issues, wq.guidance)
 
-    # ── Wound geometry ────────────────────────────────────────────────────────
+    binary_mask = (probs >= CFG.THRESHOLD).astype(np.uint8)
+    wound_pixels = int(binary_mask.sum())
+    total_pixels = int(binary_mask.size)
+
+    full_mask = upsample_mask_to_image_size(binary_mask, pil_image)
+    w0, h0 = pil_image.size
+    full_pixels = int(w0 * h0)
+    wound_area_pct = float(full_mask.sum() / full_pixels) if full_pixels > 0 else 0.0
+
     measurements = compute_measurements(
-        binary_mask,
+        full_mask,
         px_per_mm=nail_result.px_per_mm,
         scale_source=nail_result.source,
     )
 
-    # ── Confidence-based proxy metrics (no ground truth at inference time) ────
-    high_conf    = (probs > 0.8).astype(np.uint8)
+    high_conf = (probs > 0.8).astype(np.uint8)
     intersection = int(np.logical_and(binary_mask, high_conf).sum())
-    union        = int(np.logical_or(binary_mask, high_conf).sum())
-    iou          = intersection / union if union > 0 else 0.0
-    denom        = int(binary_mask.sum() + high_conf.sum())
-    dice         = 2 * intersection / denom if denom > 0 else 0.0
-    mean_prob    = float(probs[binary_mask == 1].mean()) if wound_pixels > 0 else 0.0
-    recall       = mean_prob
-    precision    = float(high_conf.sum() / max(wound_pixels, 1))
-    roc_auc      = float(np.clip(mean_prob * 1.05, 0.0, 1.0))
+    union = int(np.logical_or(binary_mask, high_conf).sum())
+    conf_iou = intersection / union if union > 0 else 0.0
+    denom = int(binary_mask.sum() + high_conf.sum())
+    conf_dice = 2 * intersection / denom if denom > 0 else 0.0
+    mean_prob = float(probs[binary_mask == 1].mean()) if wound_pixels > 0 else 0.0
+    conf_recall = mean_prob
+    conf_precision = float(high_conf.sum() / max(wound_pixels, 1))
+    conf_roc_auc = float(np.clip(mean_prob * 1.05, 0.0, 1.0))
 
-    # ── Tissue classification (optional) ─────────────────────────────────────
-    tissue_breakdown, _, tissue_mask_b64 = run_tissue_inference(pil_image, binary_mask)
+    tissue_breakdown, _, tissue_mask_b64 = run_tissue_inference(pil_image, full_mask)
 
-    # ── Wound type classification (optional) ──────────────────────────────────
-    wound_type_label      = None
+    wound_type_label = None
     wound_type_confidence = None
     if classifier_model is not None:
         try:
@@ -366,6 +483,9 @@ async def analyze(request: Request, image: UploadFile = File(...)):
             wound_type_confidence = round(wound_type_confidence, 4)
         except Exception as exc:
             logger.warning("[WoundWatch] Classifier inference failed: %s", exc)
+
+    probs_full = resize_probs_to_image_size(probs, pil_image)
+    prob_b64 = prob_heatmap_to_base64(probs_full)
 
     logger.info(
         "[WoundWatch] Analysed image: area=%.2f cm² (%.2f%%), scale=%s, tissue=%s",
@@ -376,51 +496,94 @@ async def analyze(request: Request, image: UploadFile = File(...)):
     )
 
     return AnalysisResult(
-        photo_quality_passed=quality.passed,
-        photo_issues=quality.issues,
-        photo_blur_score=quality.blur_score,
-        photo_brightness=quality.brightness,
-
-        iou=round(iou, 4),
-        dice=round(dice, 4),
-        recall=round(recall, 4),
-        precision=round(precision, 4),
-        roc_auc=round(roc_auc, 4),
-
+        photo_quality_passed=basic_quality.passed,
+        photo_issues=basic_quality.issues,
+        photo_blur_score=basic_quality.blur_score,
+        photo_brightness=basic_quality.brightness,
+        confidence_iou=round(conf_iou, 4),
+        confidence_dice=round(conf_dice, 4),
+        confidence_recall=round(conf_recall, 4),
+        confidence_precision=round(conf_precision, 4),
+        confidence_roc_auc=round(conf_roc_auc, 4),
         wound_area_px=measurements.wound_area_px,
         wound_area_pct=round(wound_area_pct, 4),
         wound_width_px=measurements.wound_width_px,
         wound_height_px=measurements.wound_height_px,
         wound_perimeter_px=measurements.wound_perimeter_px,
-
         bbox_x_min=measurements.bbox_x_min,
         bbox_y_min=measurements.bbox_y_min,
         bbox_x_max=measurements.bbox_x_max,
         bbox_y_max=measurements.bbox_y_max,
-
         wound_area_cm2=measurements.wound_area_cm2,
         wound_width_cm=measurements.wound_width_cm,
         wound_height_cm=measurements.wound_height_cm,
         wound_perimeter_cm=measurements.wound_perimeter_cm,
-
         scale_px_per_mm=measurements.scale_px_per_mm,
         scale_source=measurements.scale_source,
-
-        tissue_granulation       = tissue_breakdown.get("granulation")       if tissue_breakdown else None,
-        tissue_slough            = tissue_breakdown.get("slough")            if tissue_breakdown else None,
-        tissue_eschar            = tissue_breakdown.get("eschar")            if tissue_breakdown else None,
-        tissue_epithelialisation = tissue_breakdown.get("epithelialisation") if tissue_breakdown else None,
-        tissue_model_available   = tissue_model is not None,
-
-        wound_type             = wound_type_label,
-        wound_type_confidence  = wound_type_confidence,
-        wound_type_available   = classifier_model is not None,
-
-        push_score_area    = compute_push_area_score_v2(measurements.wound_area_cm2),
-
-        mask_base64        = mask_to_base64(binary_mask),
-        tissue_mask_base64 = tissue_mask_b64,
+        tissue_granulation=tissue_breakdown.get("granulation") if tissue_breakdown else None,
+        tissue_slough=tissue_breakdown.get("slough") if tissue_breakdown else None,
+        tissue_eschar=tissue_breakdown.get("eschar") if tissue_breakdown else None,
+        tissue_epithelialisation=tissue_breakdown.get("epithelialisation") if tissue_breakdown else None,
+        tissue_model_available=tissue_model is not None,
+        wound_type=wound_type_label,
+        wound_type_confidence=wound_type_confidence,
+        wound_type_available=classifier_model is not None,
+        push_score_area=compute_push_area_score_v2(measurements.wound_area_cm2),
+        mask_base64=mask_to_base64(full_mask),
+        prob_heatmap_base64=prob_b64,
+        tissue_mask_base64=tissue_mask_b64,
     )
+
+
+@app.post("/analyze", response_model=AnalysisResult)
+async def analyze(request: Request, image: UploadFile = File(...)):
+    """U-Net segmentation — one forward pass per request (see validate_wound_from_probs)."""
+    api_secret = os.environ.get("MODEL_API_SECRET")
+    if not api_secret or request.headers.get("X-API-Secret") != api_secret:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Secret header")
+
+    if model is None:
+        if model_load_error:
+            raise HTTPException(status_code=503, detail=model_load_error)
+        raise HTTPException(status_code=503, detail="Model is still loading; retry in a few seconds")
+
+    image_bytes = await image.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="Image larger than 15 MB")
+
+    try:
+        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not open image: {exc}")
+
+    basic = validate_photo_basic(pil_image)
+    if not basic.passed:
+        logger.info("[WoundWatch] Photo rejected (basic): %s", basic.issues)
+        raise HTTPException(
+            status_code=422,
+            detail=PhotoQualityError(
+                issues=basic.issues,
+                guidance=basic.guidance,
+            ).model_dump(),
+        )
+
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(_analyze_sync, pil_image, basic), timeout=30.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Inference timed out") from None
+    except _WoundQualityReject as rej:
+        logger.info("[WoundWatch] Photo rejected (wound): %s", rej.issues)
+        raise HTTPException(
+            status_code=422,
+            detail=PhotoQualityError(
+                issues=rej.issues,
+                guidance=rej.guidance,
+            ).model_dump(),
+        ) from None
+
+    return result
 
 
 # ── /push-score endpoint ────────────────────────────────────────────────────────
