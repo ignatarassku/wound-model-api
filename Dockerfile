@@ -29,11 +29,12 @@ RUN if [ -n "$BINARY_CHECKPOINT_FETCH_URL" ]; then \
       curl -fSL --output checkpoints/best_model.pth "$BINARY_CHECKPOINT_FETCH_URL"; \
     fi
 
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
 RUN adduser --disabled-password --gecos '' appuser && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000
-
-COPY start.sh /app/start.sh
 
 ENTRYPOINT ["/app/start.sh"]
