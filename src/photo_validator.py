@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 
 MIN_SHORT_SIDE_PX: int = 200
-BLUR_LAPLACIAN_MIN: float = 80.0
+BLUR_LAPLACIAN_MIN: float = 30.0
 BRIGHTNESS_MIN: float = 35.0
 BRIGHTNESS_MAX: float = 225.0
 MIN_WOUND_AREA_PCT: float = 0.003
