@@ -13,11 +13,11 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-MEAN_NAIL_WIDTH_MM: float = 16.5
+MEAN_NAIL_WIDTH_MM: float = 16.5   # population fallback only
 MIN_NAIL_CONF: float = 0.35
 _NAIL_YOLO_CLASSES: set[int] = {0}
 _FALLBACK_PX_PER_MM: float = 3.2
-_YOLO_WEIGHTS: str = "yolov8n.pt"
+_YOLO_WEIGHTS: str = "checkpoints/nail_detector.pt"
 
 _yolo_model = None
 
@@ -113,11 +113,34 @@ def _detect_nail_yolo(image_np: np.ndarray) -> Optional[NailDetectionResult]:
     )
 
 
-def detect_nail(image: Image.Image) -> NailDetectionResult:
+def detect_nail(
+    image: Image.Image,
+    patient_nail_width_mm: Optional[float] = None,
+) -> NailDetectionResult:
+    """
+    Detect fingernail in image and compute scale factor.
+
+    If patient_nail_width_mm is provided, it is used instead of the population
+    average (MEAN_NAIL_WIDTH_MM), giving a personalised and more accurate scale.
+    """
     image_np = np.array(image.convert("RGB"))
+    nail_width_mm = patient_nail_width_mm if patient_nail_width_mm and patient_nail_width_mm > 0 else MEAN_NAIL_WIDTH_MM
 
     result = _detect_nail_yolo(image_np)
     if result is not None:
+        if patient_nail_width_mm and patient_nail_width_mm > 0:
+            # Recalculate px_per_mm using patient's actual nail width
+            px_per_mm = result.nail_width_px / patient_nail_width_mm
+            logger.info(
+                "[NailDetector] Using patient nail width %.1f mm → %.3f px/mm",
+                patient_nail_width_mm, px_per_mm,
+            )
+            return NailDetectionResult(
+                px_per_mm=round(px_per_mm, 4),
+                source="fingernail_patient_measured",
+                nail_width_px=result.nail_width_px,
+                confidence=result.confidence,
+            )
         return result
 
     logger.info(

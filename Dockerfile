@@ -19,11 +19,14 @@ RUN pip install --no-cache-dir torch==2.11.0 torchvision==0.26.0 \
     --index-url https://download.pytorch.org/whl/cpu
 RUN grep -v '^torch' requirements.txt > /tmp/req.txt && pip install --no-cache-dir -r /tmp/req.txt
 
-RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
-
 COPY . .
 
-# Optional build-time fetch of model checkpoint
+# Verify fine-tuned nail detector loads correctly at build time
+RUN python -c "from ultralytics import YOLO; YOLO('checkpoints/nail_detector.pt'); print('nail_detector.pt OK')"
+
+# Optional build-time fetch: set Railway variable BINARY_CHECKPOINT_FETCH_URL to a direct HTTPS URL
+# of best_model.pth (same value can be used as runtime BINARY_CHECKPOINT_URL instead — see .env.example).
+# Signed / expiring URLs: prefer runtime BINARY_CHECKPOINT_URL only (avoids stale URLs baked in layers).
 ARG BINARY_CHECKPOINT_FETCH_URL=
 RUN if [ -n "$BINARY_CHECKPOINT_FETCH_URL" ]; then \
       curl -fSL --output checkpoints/best_model.pth "$BINARY_CHECKPOINT_FETCH_URL"; \
